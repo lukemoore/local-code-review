@@ -11,6 +11,8 @@ let handoffSnapshotId = null;
 let importedSnapshotId = null;
 let handoffPosition = null;
 const snapshotPositions = new Map();
+const threadDrafts = new Map();
+const composerDrafts = new Map();
 let positionTimer;
 let actionPosition = null;
 let commentTargets = [];
@@ -168,8 +170,8 @@ async function loadSnapshot(id) {
   const next = await api(`snapshot/?id=${encodeURIComponent(id)}`);
   snapshot = next;
   history.replaceState(null, '', `?snapshot=${snapshot.id}`);
-  closeComposer();
   render();
+  restoreComposer();
   const target = savedPosition(snapshot.id) ||
     (previous?.review_id === snapshot.review_id ? position : {x: 0, y: 0});
   await restoreReadingPosition(target);
@@ -247,6 +249,7 @@ function render() {
   $('#welcome').hidden = true;
   $('#review').hidden = false;
   $('#title').textContent = snapshot.title;
+  $('#general').textContent = snapshot.session_comment ? 'Edit session-wide comment' : 'Add session-wide comment';
   $('#path').textContent = snapshot.working_copy;
   selectReview();
   $('#snapshots').replaceChildren();
@@ -528,6 +531,7 @@ function thread(comment) {
   resolve.addEventListener('click', () => act(async () => {
     await api(comment.can_delete ? 'delete/' : 'resolve/',
       {comment_id: comment.id, resolved: !comment.resolved});
+    if (comment.can_delete) threadDrafts.delete(comment.id);
     await loadSnapshot(snapshot.id);
   }));
   heading.append(resolve);
@@ -546,6 +550,10 @@ function thread(comment) {
       body.innerHTML = message.body_html;
     }
     entry.append(body);
+    if (message.author === 'codex' && message.earlier_request) {
+      entry.append(node('p', 'hint', message.answered_version == null ?
+        'Answer to an earlier or unknown request version.' : 'Answer to an earlier request.'));
+    }
     if (message.author === 'codex' && message.needs_review && !message.reviewed && !comment.resolved) {
       entry.classList.add('needs-review');
       const reviewed = node('button', 'review-message', 'Mark reviewed');
@@ -558,6 +566,8 @@ function thread(comment) {
   });
   const form = node('form', 'reply-form');
   const input = node('textarea');
+  input.value = threadDrafts.get(comment.id)?.body || '';
+  input.addEventListener('input', () => threadDrafts.set(comment.id, {body: input.value}));
   input.rows = 2;
   input.required = true;
   input.maxLength = 50000;
@@ -580,14 +590,19 @@ function thread(comment) {
       original.hidden = false;
       edit.hidden = false;
     };
-    cancel.onclick = closeEditor;
-    edit.onclick = () => {
-      input.value = comment.messages[0].body;
+    cancel.onclick = () => {
+      threadDrafts.delete(comment.id);
+      closeEditor();
+    };
+    const openEditor = () => {
+      input.value = threadDrafts.get(comment.id)?.body ?? comment.messages[0].body;
+      threadDrafts.set(comment.id, {body: input.value});
       form.hidden = false;
       original.hidden = true;
       edit.hidden = true;
-      input.focus();
     };
+    edit.onclick = () => { openEditor(); input.focus(); };
+    if (threadDrafts.has(comment.id)) openEditor();
     if (snapshot.batches.length) {
       form.prepend(node('p', 'hint', 'Existing agent prompts keep the earlier text. Send comments to agent again after saving.'));
     }
@@ -595,7 +610,9 @@ function thread(comment) {
   form.addEventListener('submit', event => {
     event.preventDefault();
     act(async () => {
+      const submittedDraft = threadDrafts.get(comment.id);
       await api(newComment ? 'edit/' : 'reply/', {comment_id: comment.id, body: input.value});
+      if (threadDrafts.get(comment.id) === submittedDraft) threadDrafts.delete(comment.id);
       await loadSnapshot(snapshot.id);
       if (newComment) {
         document.getElementById(`comment-${comment.id}`).scrollIntoView({block: 'center'});
@@ -614,6 +631,7 @@ function selectLine(path, line, extend) {
   $('#selection-label').textContent = `${path} · lines ${selection.start}–${selection.end}`;
   $('#composer').hidden = false;
   document.body.classList.add('composing');
+  rememberComposer();
   document.querySelectorAll('tr[data-line]').forEach(row => {
     row.classList.toggle('selected', row.dataset.path === path &&
       Number(row.dataset.line) >= selection.start && Number(row.dataset.line) <= selection.end);
@@ -621,12 +639,39 @@ function selectLine(path, line, extend) {
 }
 
 function closeComposer() {
+  if (snapshot) composerDrafts.delete(snapshot.id);
+  resetComposer();
+}
+
+function resetComposer() {
   hideSelectionButton();
   selection = null;
   $('#composer').hidden = true;
   $('#comment-body').value = '';
   document.body.classList.remove('composing');
   document.querySelectorAll('tr.selected').forEach(row => row.classList.remove('selected'));
+}
+
+function rememberComposer() {
+  if (snapshot && selection) {
+    composerDrafts.set(snapshot.id, {selection: {...selection}, body: $('#comment-body').value});
+  }
+}
+
+function restoreComposer() {
+  resetComposer();
+  const draft = composerDrafts.get(snapshot.id);
+  if (!draft) return;
+  selection = {...draft.selection};
+  $('#comment-body').value = draft.body;
+  if (selection.path) {
+    const endpoint = selection.anchor === selection.start ? selection.end : selection.start;
+    selectLine(selection.path, endpoint, true);
+  } else {
+    $('#selection-label').textContent = selection.comment_id ? 'Edit session-wide comment' : 'Session-wide comment';
+    $('#composer').hidden = false;
+    document.body.classList.add('composing');
+  }
 }
 
 function hideSelectionButton() {
@@ -639,13 +684,28 @@ function showSelectionButton() {
   hideSelectionButton();
   if (!text.rangeCount || text.isCollapsed || !text.toString().trim()) return;
   const range = text.getRangeAt(0);
-  const sourceRow = container => {
-    const element = container.nodeType === Node.ELEMENT_NODE ? container : container.parentElement;
-    return element.closest('#diff .source')?.closest('tr[data-line]');
-  };
-  const first = sourceRow(range.startContainer);
-  const last = sourceRow(range.endContainer);
-  if (!first || !last || first.dataset.path !== last.dataset.path) return;
+  const container = range.commonAncestorContainer;
+  const element = container.nodeType === Node.ELEMENT_NODE ? container : container.parentElement;
+  const section = element.closest('#diff .file');
+  if (!section) return;
+  // Browser selections can end in the next row, outside its source text.
+  // Anchor to the new-side text actually selected, not the endpoint cells.
+  const selected = [...section.querySelectorAll('tr[data-line] .source')].flatMap(cell => {
+    const content = document.createRange();
+    content.selectNodeContents(cell.lastChild);
+    if (!range.intersectsNode(cell.lastChild)) return [];
+    const overlap = range.cloneRange();
+    if (range.compareBoundaryPoints(Range.START_TO_START, content) < 0) {
+      overlap.setStart(content.startContainer, content.startOffset);
+    }
+    if (range.compareBoundaryPoints(Range.END_TO_END, content) > 0) {
+      overlap.setEnd(content.endContainer, content.endOffset);
+    }
+    return overlap.toString().trim() ? [{row: cell.closest('tr'), range: overlap}] : [];
+  });
+  if (!selected.length) return;
+  const first = selected[0].row;
+  const last = selected.at(-1).row;
   const start = Number(first.dataset.line);
   const end = Number(last.dataset.line);
   const file = snapshot.files.find(file => file.path === first.dataset.path);
@@ -653,7 +713,7 @@ function showSelectionButton() {
   for (let line = start; line <= end; line++) {
     if (!lines.has(line)) return;
   }
-  const rects = [...range.getClientRects()].filter(rect => rect.width && rect.height);
+  const rects = [...selected.at(-1).range.getClientRects()].filter(rect => rect.width && rect.height);
   const rect = rects.at(-1);
   if (!rect || rect.bottom < 0 || rect.top > innerHeight) return;
   selectedText = {path: first.dataset.path, start, end};
@@ -791,19 +851,33 @@ $('#refresh').onclick = () => act(async () => {
     'Local changes loaded into a new snapshot. Earlier comments remain on their original snapshot.' :
     'No changes on disk. Showing the latest snapshot.');
 });
-$('#general').onclick = () => {
-  closeComposer();
+$('#general').onclick = () => act(async () => {
+  const existing = snapshot.session_comment;
+  if (existing && existing.snapshot_id !== snapshot.id) await loadSnapshot(existing.snapshot_id);
+  hideSelectionButton();
+  document.querySelectorAll('tr.selected').forEach(row => row.classList.remove('selected'));
+  const draft = composerDrafts.get(snapshot.id);
   selection = {path: '', start: null, end: null};
-  $('#selection-label').textContent = 'General comment';
+  if (existing) {
+    selection.comment_id = existing.id;
+    $('#comment-body').value = draft?.selection.comment_id === existing.id ?
+      draft.body : existing.messages.filter(message => message.author === 'user').at(-1).body;
+  }
+  $('#selection-label').textContent = existing ? 'Edit session-wide comment' : 'Session-wide comment';
   $('#composer').hidden = false;
   document.body.classList.add('composing');
+  rememberComposer();
   $('#comment-body').focus();
-};
+});
+$('#comment-body').addEventListener('input', rememberComposer);
 $('#cancel-comment').onclick = closeComposer;
 $('#composer').onsubmit = event => {
   event.preventDefault();
   act(async () => {
-    await api('comment/', {snapshot_id: snapshot.id, ...selection, body: $('#comment-body').value});
+    const submittedDraft = composerDrafts.get(snapshot.id);
+    await api(selection.comment_id ? 'edit/' : 'comment/',
+      {snapshot_id: snapshot.id, ...selection, body: $('#comment-body').value});
+    if (composerDrafts.get(snapshot.id) === submittedDraft) closeComposer();
     await loadSnapshot(snapshot.id);
   });
 };

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -7,7 +8,8 @@ from unittest.mock import patch
 from django.test import Client, TestCase, override_settings
 
 from .models import Batch, Comment, Message, Snapshot
-from .views import detect_repository, parse_diff
+from .views import (comments_to_send, detect_repository, import_batch,
+                    parse_diff)
 
 
 class ReviewTests(TestCase):
@@ -102,6 +104,8 @@ class ReviewTests(TestCase):
                 self.assertEqual(source['base_revision'], expected.revision)
                 self.assertEqual((directory / source['diff_file']).read_text(),
                                  expected.diff)
+                self.assertEqual(source['live_diff'] is None,
+                                 expected.id != second.id)
         self.response_file(handoff, [
             {'comment_id': first_id, 'reply': 'First reply.'},
             {'comment_id': second_comment, 'reply': 'Second reply.'},
@@ -188,6 +192,165 @@ class ReviewTests(TestCase):
         data = self.client.get('/api/snapshot/', {'id': first.id}).json()
         self.assertFalse(data['has_comments_to_send'])
         self.post('export', {'snapshot_id': first.id}, status=400)
+
+    def test_one_session_comment_across_snapshots_and_edit_after_reply(self):
+        snapshot = self.create()
+        comment_id = self.post('comment', {
+            'snapshot_id': snapshot.id, 'body': 'Session request'})['comment_id']
+        self.source.write_text(self.original.replace('line 3', 'different'))
+        next_id = self.post('refresh', {
+            'review_id': snapshot.review_id})['snapshot_id']
+        self.post('comment', {
+            'snapshot_id': next_id, 'body': 'Duplicate'}, status=400)
+        data = self.client.get('/api/snapshot/', {'id': next_id}).json()
+        self.assertEqual(data['session_comment']['id'], comment_id)
+        self.assertEqual(data['session_comment']['snapshot_id'], snapshot.id)
+        self.post('reply', {'comment_id': comment_id, 'body': 'Follow-up'})
+        handoff = self.post('export', {'snapshot_id': next_id})
+        path = self.response_file(handoff, [{
+            'comment_id': comment_id, 'reply': 'Done'}])
+        import_batch(handoff['batch_id'], path)
+        self.post('resolve', {'comment_id': comment_id, 'resolved': True})
+        self.post('edit', {'comment_id': comment_id, 'body': 'Changed request'})
+        comment = Comment.objects.get(pk=comment_id)
+        self.assertFalse(comment.resolved)
+        self.assertEqual(comment.message_set.count(), 3)
+        message = comment.message_set.filter(author='user').latest('id')
+        self.assertEqual(message.body, 'Changed request')
+        self.assertEqual(message.version, 2)
+        self.assertTrue(comments_to_send(snapshot.review).exists())
+        self.assertEqual(Comment.objects.filter(
+            snapshot__review=snapshot.review, path='').count(), 1)
+
+    def test_late_reply_does_not_answer_followup(self):
+        snapshot = self.create()
+        comment_id = self.comment(snapshot, 'Request A')
+        handoff = self.post('export', {'snapshot_id': snapshot.id})
+        block = Batch.objects.get(pk=handoff['batch_id']).blocks[0]
+        self.assertEqual(block['request'], {
+            'id': block['messages'][0]['id'], 'version': 1})
+        self.post('reply', {'comment_id': comment_id, 'body': 'Request B'})
+        path = self.response_file(handoff, [{
+            'comment_id': comment_id, 'request': block['request'],
+            'reply': 'Answer A'}])
+        import_batch(handoff['batch_id'], path)
+        data = self.client.get('/api/snapshot/', {'id': snapshot.id}).json()
+        self.assertTrue(data['has_comments_to_send'])
+        self.assertTrue(data['comments'][0]['messages'][-1]['earlier_request'])
+        next_handoff = self.post('export', {'snapshot_id': snapshot.id})
+        next_block = Batch.objects.get(pk=next_handoff['batch_id']).blocks[0]
+        self.assertNotEqual(next_block['request']['id'], block['request']['id'])
+
+    def test_edits_and_reverse_order_handoffs(self):
+        snapshot = self.create()
+        comment_id = self.comment(snapshot, 'Request A')
+        first = self.post('export', {'snapshot_id': snapshot.id})
+        self.post('edit', {'comment_id': comment_id, 'body': 'Request B'})
+        second = self.post('export', {'snapshot_id': snapshot.id})
+        first_target = Batch.objects.get(pk=first['batch_id']).blocks[0]['request']
+        second_target = Batch.objects.get(pk=second['batch_id']).blocks[0]['request']
+        self.assertEqual(first_target['id'], second_target['id'])
+        self.assertEqual(second_target['version'], first_target['version'] + 1)
+        for handoff, text in ((second, 'Answer B'), (first, 'Answer A')):
+            path = self.response_file(handoff, [{
+                'comment_id': comment_id, 'reply': text}])
+            import_batch(handoff['batch_id'], path)
+            data = self.client.get('/api/snapshot/', {'id': snapshot.id}).json()
+            self.assertFalse(data['has_comments_to_send'])
+        replies = data['comments'][0]['messages'][1:]
+        self.assertEqual([m['earlier_request'] for m in replies], [False, True])
+
+    def test_followup_handoffs_imported_in_reverse_order(self):
+        snapshot = self.create()
+        comment_id = self.comment(snapshot, 'Request A')
+        first = self.post('export', {'snapshot_id': snapshot.id})
+        self.post('reply', {'comment_id': comment_id, 'body': 'Request B'})
+        second = self.post('export', {'snapshot_id': snapshot.id})
+        for handoff in (second, first):
+            path = self.response_file(handoff, [{
+                'comment_id': comment_id, 'reply': 'Answer'}])
+            import_batch(handoff['batch_id'], path)
+            self.assertFalse(comments_to_send(snapshot.review).exists())
+        self.post('reply', {'comment_id': comment_id, 'body': 'Request C'})
+        self.assertTrue(comments_to_send(snapshot.review).exists())
+
+    def test_late_reply_does_not_answer_edited_request(self):
+        snapshot = self.create()
+        comment_id = self.comment(snapshot, 'Request A')
+        handoff = self.post('export', {'snapshot_id': snapshot.id})
+        # Returning to the original text must still be a new version.
+        for text in ('Request B', 'Request A'):
+            self.post('edit', {'comment_id': comment_id, 'body': text})
+        path = self.response_file(handoff, [{
+            'comment_id': comment_id, 'reply': 'Answer A'}])
+        import_batch(handoff['batch_id'], path)
+        data = self.client.get('/api/snapshot/', {'id': snapshot.id}).json()
+        self.assertTrue(data['has_comments_to_send'])
+        self.assertTrue(data['comments'][0]['messages'][-1]['earlier_request'])
+
+    def test_legacy_handoffs_match_only_unchanged_frozen_requests(self):
+        snapshot = self.create()
+        for change in ('unchanged', 'followup', 'edit', 'old_edit'):
+            with self.subTest(change=change):
+                comment_id = self.comment(snapshot, 'Request A')
+                handoff = self.post('export', {'snapshot_id': snapshot.id})
+                batch = Batch.objects.get(pk=handoff['batch_id'])
+                batch.blocks = [b for b in batch.blocks if b['id'] == comment_id]
+                block = batch.blocks[0]
+                block.pop('request')
+                for message in block['messages']:
+                    message.pop('version')
+                batch.save(update_fields=['blocks'])
+                if change == 'followup':
+                    self.post('reply', {'comment_id': comment_id, 'body': 'B'})
+                elif change == 'edit':
+                    self.post('edit', {'comment_id': comment_id, 'body': 'B'})
+                elif change == 'old_edit':
+                    # Simulate an edit made before versions existed.
+                    Message.objects.filter(comment_id=comment_id).update(body='B')
+                path = self.response_file(handoff, [{
+                    'comment_id': comment_id, 'reply': 'Legacy answer'}])
+                import_batch(batch.id, path)
+                # Simulate a reply imported before the schema upgrade too.
+                for old_database in (False, True):
+                    if old_database:
+                        Message.objects.filter(comment_id=comment_id,
+                            author='codex').update(
+                                answered_message_id=None, answered_version=None)
+                    self.assertEqual(comments_to_send(snapshot.review).filter(
+                        pk=comment_id).exists(), change != 'unchanged')
+
+    def test_wrong_request_version_rejects_entire_import(self):
+        snapshot = self.create()
+        comment_id = self.comment(snapshot)
+        handoff = self.post('export', {'snapshot_id': snapshot.id})
+        path = self.response_file(handoff, [{
+            'comment_id': comment_id, 'reply': 'Wrong version',
+            'request': {'id': 123456, 'version': 9}}])
+        with self.assertRaisesMessage(ValueError, 'request does not match'):
+            import_batch(handoff['batch_id'], path)
+        self.assertFalse(Batch.objects.get(pk=handoff['batch_id']).imported)
+        self.assertFalse(Message.objects.filter(author='codex').exists())
+
+    def test_diff_source_separators_are_not_record_boundaries(self):
+        source = 'keep\u2028+not an addition\fmore\vtext\x85end\r'
+        diff = ('Index: first.txt\n@@ -1,2 +1,2 @@\n ' + source +
+                '\n-old\n+new\n@@ -10 +10 @@\n-before\n+after\n'
+                'Index: second.txt\n@@ -3 +3 @@\n-x\n+y')
+        for suffix in ('', '\n'):
+            self.assertEqual(''.join(f['diff'] for f in parse_diff(
+                diff + suffix, include_diff=True)), diff + suffix)
+            files = parse_diff(diff + suffix)
+            self.assertEqual([f['path'] for f in files],
+                             ['first.txt', 'second.txt'])
+            rows = files[0]['rows']
+            self.assertEqual(rows[1], {
+                'kind': 'context', 'old': 1, 'new': 1, 'text': source})
+            self.assertEqual([(r['text'], r['new']) for r in rows
+                              if r['kind'] == 'add'], [('new', 2), ('after', 10)])
+            self.assertEqual(files[1]['rows'][-1], {
+                'kind': 'add', 'old': None, 'new': 3, 'text': 'y'})
+        self.assertEqual(parse_diff(''), [])
 
     def test_capture_context_and_snapshot_preservation(self):
         first = self.create()
@@ -369,12 +532,87 @@ class ReviewTests(TestCase):
         self.assertEqual(self.client.get('/api/snapshot/', {
             'id': snapshot.id}).json()['review_queue'], [])
 
+    def test_handoff_file_diffs_and_live_verification(self):
+        # Keep unrelated changes large enough to catch accidental inclusion.
+        unrelated = self.working_copy / 'removed.txt'
+        self.addCleanup(unrelated.write_bytes, unrelated.read_bytes())
+        unrelated.write_text('unrelated\n' * 2000)
+        snapshot = self.create()
+        self.comment(snapshot)
+        handoff = self.post('export', {'snapshot_id': snapshot.id})
+        directory = Path(handoff['response_path']).parent
+        context = json.loads((directory / 'context.json').read_text())
+        source = context['snapshots'][0]
+        self.assertEqual(len(source['files']), 2)
+        parts = [(directory / f['diff_file']).read_text()
+                 for f in source['files']]
+        self.assertEqual(''.join(parts), snapshot.diff)
+        focused = next(f for f in source['files'] if f['path'] == 'sample.txt')
+        frozen = (directory / focused['diff_file']).read_text()
+        self.assertNotIn('unrelated', frozen)
+        self.assertLess(focused['bytes'], len(snapshot.diff.encode()) / 10)
+        live = source['live_diff']
+        self.assertEqual([f['path'] for f in live['files']], ['sample.txt'])
+
+        def run(command):
+            return subprocess.run(
+                command, cwd=self.working_copy, input=b'',
+                capture_output=True, check=True, timeout=60
+            ).stdout.decode('utf-8', errors='replace')
+
+        current = run(live['verify_command'])
+        self.assertEqual(hashlib.sha256(current.encode()).hexdigest(),
+                         source['snapshot_sha256'])
+        self.assertEqual(run(live['files'][0]['command']), frozen)
+        # Export-time eligibility is not proof that a later session matches.
+        self.source.write_text('changed after export\n')
+        current = run(live['verify_command'])
+        self.assertNotEqual(hashlib.sha256(current.encode()).hexdigest(),
+                            source['snapshot_sha256'])
+        self.assertEqual((directory / focused['diff_file']).read_text(), frozen)
+
+    def test_handoff_with_unavailable_working_copy(self):
+        snapshot = self.create()
+        self.comment(snapshot)
+        with patch('review.views.detect_repository', side_effect=ValueError):
+            handoff = self.post('export', {'snapshot_id': snapshot.id})
+        directory = Path(handoff['response_path']).parent
+        context = json.loads((directory / 'context.json').read_text())
+        self.assertIsNone(context['snapshots'][0]['live_diff'])
+        self.assertTrue(context['snapshots'][0]['files'])
+
+    def test_handoff_literal_file_names(self):
+        vcs = detect_repository(self.working_copy)
+        names = ['file[1]@name.txt', 'file1@name.txt']
+        for name in names:
+            path = self.working_copy / name
+            path.write_text('new content\n')
+            target = name + '@' if vcs == 'svn' else name
+            subprocess.run([vcs, 'add', '--', target], cwd=self.working_copy,
+                           capture_output=True, check=True)
+            self.addCleanup(path.unlink)
+            if vcs == 'svn':
+                self.addCleanup(subprocess.run,
+                                ['svn', 'revert', '--', target],
+                                cwd=self.working_copy, capture_output=True,
+                                check=True)
+        snapshot = self.create()
+        self.post('comment', {'snapshot_id': snapshot.id, 'path': names[0],
+                              'start': 1, 'end': 1, 'body': 'Explain this.'})
+        handoff = self.post('export', {'snapshot_id': snapshot.id})
+        directory = Path(handoff['response_path']).parent
+        context = json.loads((directory / 'context.json').read_text())
+        command = context['snapshots'][0]['live_diff']['files'][0]['command']
+        output = subprocess.run(command, cwd=self.working_copy,
+                                capture_output=True, check=True).stdout.decode()
+        self.assertEqual([f['path'] for f in parse_diff(output)], [names[0]])
+
     def test_agent_handoff_import_and_followup(self):
         snapshot = self.create()
         comment_id = self.comment(snapshot)
         handoff = self.post('export', {'snapshot_id': snapshot.id})
         for required in (str(self.working_copy), 'context.json',
-                         'snapshot.diff', 'response.json', comment_id):
+                         'response.json', comment_id):
             self.assertIn(required, handoff['prompt'])
         self.assertIn('new or existing coding-agent session', handoff['prompt'])
         self.assertIn('ASD-STE100', handoff['prompt'])
@@ -384,7 +622,8 @@ class ReviewTests(TestCase):
         context = json.loads((directory / 'context.json').read_text())
         self.assertEqual(context['blocks'][0]['messages'][0]['body'],
                          'Please explain this change.')
-        self.assertEqual((directory / 'snapshot.diff').read_text(), snapshot.diff)
+        self.assertFalse((directory / 'snapshot.diff').exists())
+        self.assertNotIn('Read each frozen diff', handoff['prompt'])
         self.response_file(handoff, [
             {'comment_id': comment_id, 'reply': 'This changes the sample.'}])
         imported = self.post('import', {'snapshot_id': snapshot.id})
@@ -631,6 +870,9 @@ class GitReviewTests(TestCase):
         ReviewTests.test_capture_context_and_snapshot_preservation)
     test_agent_handoff_import_and_followup = (
         ReviewTests.test_agent_handoff_import_and_followup)
+    test_handoff_file_diffs_and_live_verification = (
+        ReviewTests.test_handoff_file_diffs_and_live_verification)
+    test_handoff_literal_file_names = ReviewTests.test_handoff_literal_file_names
     test_import_captures_changes_and_preserves_reviewed_snapshot = (
         ReviewTests.test_import_captures_changes_and_preserves_reviewed_snapshot)
 
@@ -680,6 +922,8 @@ class GitReviewTests(TestCase):
         for name in names:
             self.assertTrue(any(r['kind'] == 'add' and r['new'] == 1
                                 for r in files[name]))
+        self.assertEqual(''.join(f['diff'] for f in parse_diff(
+            snapshot.diff, include_diff=True)), snapshot.diff)
         self.assertTrue(any(r['kind'] == 'remove'
                             for r in files['removed.txt']))
 
@@ -696,6 +940,16 @@ class GitReviewTests(TestCase):
         snapshot = self.create()
         self.assertEqual(snapshot.revision, 'unborn HEAD')
         self.assertEqual([f['path'] for f in snapshot.files], ['new.txt'])
+        self.post('comment', {'snapshot_id': snapshot.id, 'path': 'new.txt',
+                              'start': 1, 'end': 1, 'body': 'Explain this.'})
+        handoff = self.post('export', {'snapshot_id': snapshot.id})
+        context = json.loads((Path(handoff['response_path']).parent /
+                              'context.json').read_text())
+        live = context['snapshots'][0]['live_diff']
+        for command in (live['verify_command'], live['files'][0]['command']):
+            output = subprocess.run(command, cwd=self.working_copy, input=b'',
+                                    capture_output=True, check=True).stdout
+            self.assertEqual(output.decode(), snapshot.diff)
 
     def test_worktree_and_clean_snapshot(self):
         worktree = self.root / 'linked worktree'
