@@ -236,7 +236,7 @@ function scrollToReply(messageId) {
     while (question && !question.matches('.message.user')) {
       question = question.previousElementSibling;
     }
-    (question || entry).scrollIntoView({block: 'start', behavior: 'instant'});
+    (question || entry).scrollIntoView({block: 'center', behavior: 'instant'});
     entry.focus({preventScroll: true});
     rememberPosition();
   }

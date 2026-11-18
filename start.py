@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Set up Code Review, start its local server, and open the browser."""
 
+import argparse
 import os
 from pathlib import Path
 import shutil
@@ -20,6 +21,11 @@ URL = f'http://{ADDRESS[0]}:{ADDRESS[1]}'
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        '--reload', action='store_true',
+        help='Reload the server when local code changes.')
+    args = parser.parse_args()
     server = None
     try:
         if sys.version_info < (3, 10):
@@ -41,9 +47,12 @@ def main():
         python = prepare_environment()
         run(python, ROOT / 'manage.py', 'migrate', '--noinput')
         print(f'Starting Code Review at {URL}', flush=True)
-        server = subprocess.Popen([
+        command = [
             str(python), str(ROOT / 'manage.py'), 'runserver',
-            f'{ADDRESS[0]}:{ADDRESS[1]}', '--noreload'], cwd=ROOT)
+            f'{ADDRESS[0]}:{ADDRESS[1]}']
+        if not args.reload:
+            command.append('--noreload')
+        server = subprocess.Popen(command, cwd=ROOT)
         wait_for_server(server)
         print('Keep this terminal open. Press Ctrl+C to stop.', flush=True)
         try:
